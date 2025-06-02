@@ -20,7 +20,7 @@ Getting Started
 
 * Python 3.11+ (Made with python 3.11)
 * The following libraries are required:
-    + ***pickle***
+    + ***NONE YET***
 
 ### Installation
 
