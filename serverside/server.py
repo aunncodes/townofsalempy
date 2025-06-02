@@ -3,6 +3,7 @@ import threading
 import pickle
 import queue
 import time
+import select
 from random import shuffle
 from common import enums
 from common import game
@@ -43,43 +44,6 @@ class Server:
         for player, role in zip(self.game_state.players, roles):
             player.role = role
 
-    def handle_user(self, conn, addr):
-        try:
-            if self.game_state.phase != enums.Phase.LOBBY:
-                self.send_to(conn, {'type': 'error', 'text': 'Game already in progress.'})
-                conn.close()
-                return
-
-            self.send_to(conn, "Enter your name: ")
-            name = pickle.loads(conn.recv(4096))
-            player = game.Player(None, name, len(self.users))
-            self.users.append((conn, name, player))
-            self.game_state.add_player(player)
-
-            join_msg = {'type': 'chat', 'text': f"{name} has joined the lobby."}
-            self.broadcast(conn, join_msg)
-
-            # Message reception loop only, not processing
-            while True:
-                data = conn.recv(4096)
-                if not data:
-                    break
-                msg = pickle.loads(data)
-                self.message_queue.put((conn, msg))
-        except Exception as e:
-            print(f"[ERROR] Connection issue with {addr}: {e}")
-        finally:
-            self.remove_user(conn)
-
-    def remove_user(self, conn):
-        for user in self.users:
-            if user[0] == conn:
-                name = user[1]
-                self.users.remove(user)
-                self.broadcast(conn, {'type': 'chat', 'text': f"{name} has left the game."})
-                conn.close()
-                break
-
     def get_username(self, conn):
         for user_conn, name, _ in self.users:
             if user_conn == conn:
@@ -104,49 +68,121 @@ class Server:
         return enums.Action.NONE.value
 
     def resolve_night_actions(self):
+        results = []
+        protection = {}
+
+        # Collect all actions
         for player, target_id in self.pending_actions.items():
             try:
                 target = self.game_state.players[target_id]
-                player.role.ability(player, target)
+                action_result = player.role.ability(player, target)
+                if action_result["type"] == "action_result":
+                    results.append(action_result)
             except Exception as e:
-                print(f"[ERROR] Action failed: {e}")
+                print(f"[ERROR] Could not process action: {e}")
+
+        # Resolve protection first
+        for r in results:
+            if r["effect"] == "protect":
+                target = self.game_state.players[r["target"]]
+                target.role.defense = r["defense"]
+                protection[r["target"]] = True
+
+        # Then resolve attack
+        for r in results:
+            if r["effect"] == "attack":
+                target = self.game_state.players[r["target"]]
+                if r["target"] not in protection:
+                    if r["attack"] > target.role.defense.value:
+                        target.alive = False
+
+        # Sheriff investigations
+        for r in results:
+            if r["effect"] == "investigate":
+                actor = self.game_state.players[r["actor"]]
+                conn = next((c for c, _, p in self.users if p == actor), None)
+                if conn:
+                    self.send_to(conn, {"type": "result", "text": r["result"]})
+
         self.pending_actions.clear()
 
     def process_messages(self):
         while not self.message_queue.empty():
             conn, msg = self.message_queue.get()
+            entry = next((u for u in self.users if u[0] == conn), None)
+
+            if entry and entry[1] is None and isinstance(msg, str):
+                # Treat first message as name during LOBBY
+                name = msg.strip()
+                player = game.Player(None, name, len(self.game_state.players))
+                self.users[self.users.index(entry)] = (conn, name, player)
+                self.game_state.add_player(player)
+                self.broadcast(conn, {"type": "chat", "text": f"{name} has joined the lobby."})
+                return
+
             player = self.get_player_by_conn(conn)
             name = self.get_username(conn)
 
-            if isinstance(msg, str):
-                if msg == "/m":
-                    user_list = ", ".join([f"<{u[1]}>" for u in self.users])
-                    self.send_to(conn, {'type': 'chat', 'text': f"Active users: {user_list}"})
-                else:
-                    if self.game_state.phase != enums.Phase.DAY:
-                        self.send_to(conn, {'type': 'error', 'text': 'Chat is only allowed during the DAY phase.'})
+            if isinstance(msg, dict):
+                msg_type = msg.get("type")
+                if msg_type == "chat":
+                    if self.game_state.phase == enums.Phase.DAY:
+                        self.broadcast(conn, {'type': 'chat', 'text': f"<{name}> {msg.get('text')}"})
                     else:
-                        self.broadcast(conn, {'type': 'chat', 'text': f"<{name}> {msg}"})
+                        self.send_to(conn, {'type': 'error', 'text': 'Chat only allowed during DAY.'})
 
-            elif isinstance(msg, dict):
-                if msg.get("type") == "action" and self.game_state.phase == enums.Phase.NIGHT:
+                elif msg_type == "action" and self.game_state.phase == enums.Phase.NIGHT:
                     expected = self.get_expected_action(player.role)
                     if msg.get("action") == expected:
                         self.pending_actions[player] = msg["target"]
                         self.send_to(conn, {'type': 'info', 'text': 'Night action received.'})
                     else:
                         self.send_to(conn, {'type': 'error', 'text': 'Invalid night action.'})
-                elif msg.get("type") == "chat":
-                    if self.game_state.phase == enums.Phase.DAY:
-                        self.broadcast(conn, {'type': 'chat', 'text': f"<{name}> {msg.get('text')}"})
-                    else:
-                        self.send_to(conn, {'type': 'error', 'text': 'Chat only allowed during DAY.'})
+
+    def remove_user(self, conn):
+        for user in self.users:
+            if user[0] == conn:
+                name = user[1]
+                self.users.remove(user)
+                self.broadcast(conn, {'type': 'chat', 'text': f"{name} has left the game."})
+                conn.close()
+                break
 
     def game_loop(self):
         print("Game loop started.")
         while True:
+            # Accept new connections if in lobby phase
+            if self.game_state.phase == enums.Phase.LOBBY:
+                try:
+                    self.server_socket.settimeout(0.1)
+                    conn, addr = self.server_socket.accept()
+                    print(f"Connection from {addr}")
+                    conn.setblocking(False)
+                    self.users.append((conn, None, None))  # Temporarily store until they register
+                    self.send_to(conn, "Enter your name: ")
+                except socket.timeout:
+                    pass
+            else:
+                self.server_socket.settimeout(None)
+
+            # Poll all connected sockets
+            sockets = [u[0] for u in self.users]
+            if sockets:
+                readable, _, _ = select.select(sockets, [], [], 0.05)
+                for sock in readable:
+                    try:
+                        data = sock.recv(4096)
+                        if not data:
+                            self.remove_user(sock)
+                            continue
+                        msg = pickle.loads(data)
+                        self.message_queue.put((sock, msg))
+                    except:
+                        self.remove_user(sock)
+
             self.process_messages()
 
+            # Start game from lobby
             if self.game_state.phase == enums.Phase.LOBBY:
                 if len(self.game_state.players) >= self.MIN_PLAYERS:
                     self.assign_roles()
@@ -158,17 +194,13 @@ class Server:
             elif self.game_state.phase == enums.Phase.NIGHT:
                 self.broadcast_all({'type': 'phase', 'phase': self.game_state.phase})
                 self.pending_actions.clear()
-
-                # Wait for night actions (up to 20 seconds)
                 start = time.time()
                 while time.time() - start < 20:
                     self.process_messages()
                     time.sleep(0.1)
-
                 self.resolve_night_actions()
                 for player in self.game_state.players:
                     player.role.on_night_end(player)
-
                 self.game_state.phase = enums.Phase.DAY
 
             elif self.game_state.phase == enums.Phase.DAY:
@@ -178,21 +210,13 @@ class Server:
                 time.sleep(30)
                 self.game_state.phase = enums.Phase.NIGHT
 
-            time.sleep(0.1)  # prevent tight loop CPU burn
+            time.sleep(0.1)
 
     def start(self):
-        game_thread = threading.Thread(target=self.game_loop, daemon=True)
-        game_thread.start()
-
         try:
-            while True:
-                conn, addr = self.server_socket.accept()
-                print(f"Connection from {addr}")
-                t = threading.Thread(target=self.handle_user, args=(conn, addr))
-                t.start()
+            threading.Thread(target=self.game_loop, daemon=False).start()
         except KeyboardInterrupt:
             print("Shutting down server.")
-        finally:
             self.server_socket.close()
 
 

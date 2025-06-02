@@ -6,12 +6,12 @@ import os
 
 class GameClient:
     COLORS = {
-        "RED": "\033[91m",
-        "GREEN": "\033[92m",
-        "YELLOW": "\033[93m",
-        "BLUE": "\033[94m",
-        "CYAN": "\033[96m",
-        "RESET": "\033[0m"
+        "RED": "\\033[91m",
+        "GREEN": "\\033[92m",
+        "YELLOW": "\\033[93m",
+        "BLUE": "\\033[94m",
+        "CYAN": "\\033[96m",
+        "RESET": "\\033[0m"
     }
 
     def __init__(self, host='127.0.0.1', port=5000):
@@ -61,9 +61,7 @@ class GameClient:
             elif msg_type == "phase":
                 phase = message.get("phase", "").name.upper()
                 self.current_phase = phase
-                print(self.colorize(f"\n[PHASE] {phase} phase has begun.", "BLUE"))
-                if phase == "NIGHT" and self.alive:
-                    self.send_night_action()
+                print(self.colorize(f"\\n[PHASE] {phase} phase has begun.", "BLUE"))
 
             elif msg_type == "error":
                 print(self.colorize(f"[ERROR] {message.get('text')}", "RED"))
@@ -91,34 +89,14 @@ class GameClient:
             self.messages = message
             self.render_messages()
 
-    def send_night_action(self):
-        try:
-            print(self.colorize("[ACTION] Enter the ID of the player you want to target tonight:", "CYAN"))
-            target_id = input("Target ID > ").strip()
-            if target_id.isdigit():
-                self.client_socket.sendall(pickle.dumps({
-                    "type": "action",
-                    "action": self.get_action_type(),
-                    "target": int(target_id)
-                }))
-                print(self.colorize("[ACTION] Night action sent.", "GREEN"))
-            else:
-                print(self.colorize("[ERROR] Invalid ID.", "RED"))
-                self.send_night_action()
-        except Exception as e:
-            print(self.colorize(f"[ERROR] Could not send night action: {e}", "RED"))
-
     def get_action_type(self):
-        if not self.role:
+        if not self.role or not hasattr(self.role, "name"):
             return None
-        role_name = self.role.name.lower()
-        if role_name == "mafioso":
-            return "attack"
-        elif role_name == "doctor":
-            return "protect"
-        elif role_name == "sheriff":
-            return "investigate"
-        return None
+        return {
+            "mafioso": "attack",
+            "doctor": "protect",
+            "sheriff": "investigate"
+        }.get(self.role.name.lower(), None)
 
     def render_messages(self):
         self.clear_screen()
@@ -139,11 +117,22 @@ class GameClient:
                     self.running = False
                     break
 
-                # Raw commands (like /m) can be sent as strings
-                if user_input.startswith("/"):
-                    self.client_socket.sendall(pickle.dumps(user_input))
-                else:
-                    self.client_socket.sendall(pickle.dumps({"type": "chat", "text": user_input}))
+                if user_input.startswith("/t") and self.current_phase == "NIGHT" and self.alive:
+                    parts = user_input.split()
+                    if len(parts) == 2 and parts[1].isdigit():
+                        action_type = self.get_action_type()
+                        if action_type:
+                            self.client_socket.sendall(pickle.dumps({
+                                "type": "action",
+                                "action": action_type,
+                                "target": int(parts[1])
+                            }))
+                            print(self.colorize("[ACTION] Night action sent.", "GREEN"))
+                            continue
+                    print(self.colorize("[ERROR] Invalid format. Use /t <target_id>", "RED"))
+                    continue
+
+                self.client_socket.sendall(pickle.dumps({"type": "chat", "text": user_input}))
             except Exception as e:
                 print(self.colorize(f"[ERROR] Error sending message: {e}", "RED"))
                 break
